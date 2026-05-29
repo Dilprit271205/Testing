@@ -48,7 +48,6 @@ class RunningStats:
 @st.cache_resource
 class SystemStateStore:
     def __init__(self):
-        # FIXED: Migrated from Lock to RLock to completely prevent nested deadlocks
         self.lock = threading.RLock()
         self.active_processes = {}  
         self.alerts = []            
@@ -222,8 +221,10 @@ class FrameworkEvaluator:
             file_ops = 0
             if cpu > 40.0 or mem_mb > 300.0 or children_count > 5:
                 try:
-                    # FIXED: Use net_connections to avoid deprecation warnings
                     connections = len(proc.net_connections())
+                except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+                    pass
+                try:
                     file_ops = len(proc.open_files())
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
                     pass
@@ -292,7 +293,6 @@ def run_healing_daemon(store: SystemStateStore):
         # Iterate over all system processes
         for proc_info in psutil.process_iter(['pid', 'name']):
             try:
-                # FIXED: Added fallback verification to prevent unhandled KeyError or TypeError crashes
                 if not proc_info.info:
                     continue
                 pid = proc_info.info.get('pid')
@@ -467,7 +467,6 @@ col4.metric("Active Fork Bomb Threats", active_fork_bombs, delta="Blocked" if ac
 # INTERACTIVE VIEW: Inspect Learned Baselines
 st.subheader("🔍 Inspect Learned Behavioral Profiles (Dynamic Baselines)")
 if learned_profiles:
-    # FIXED: Added raw string formatting to prevent the syntax warning during selection rendering
     selected_name = st.selectbox(
         r"Select a registered process name to view its dynamically learned mean ($\mu$) and standard deviation ($\sigma$):", 
         sorted(learned_profiles)
@@ -502,7 +501,7 @@ if alerts_data:
         
     st.dataframe(
         df_alerts.style.apply(color_alerts, axis=1),
-        width="width", 
+        width="stretch", # FIXED: Changed from 'width' to 'stretch' to prevent crash on Python 3.13 Streamlit
         hide_index=True
     )
 else:
@@ -524,7 +523,7 @@ if not df_proc.empty:
 
     st.dataframe(
         df_sorted.style.map(color_status, subset=["Status"]),
-        width="width", 
+        width="stretch", # FIXED: Changed from 'width' to 'stretch' to prevent crash on Python 3.13 Streamlit
         hide_index=True,
         column_order=["PID", "Name", "Lineage Chain", "Static Trust (Ts)", "Dynamic Trust (Td)", "Final Trust T(p,t)", "Status", "Action/State"]
     )
