@@ -9,7 +9,7 @@ import streamlit as st
 
 # Page Configuration
 st.set_page_config(
-    page_title="Dynamic Self-Healing EDR",
+    page_title="Lineage-Aware Self-Healing EDR",
     page_icon="🛡️",
     layout="wide"
 )
@@ -18,19 +18,12 @@ st.set_page_config(
 # 1. LIGHTWEIGHT RUNNING STATS (Welford's Algorithm)
 # ==========================================
 class RunningStats:
-    """
-    Computes running mean and standard deviation with O(1) memory and compute.
-    Protects system performance under heavy process loads.
-    """
     def __init__(self, initial_mean: float, initial_std: float):
-        # We start with a virtual count of 20 to seed the baseline with Slide values
         self.count = 20
         self.mean = initial_mean
-        # M2 = variance * (count - 1)
         self.M2 = (initial_std ** 2) * (self.count - 1)
 
     def update(self, x: float):
-        """Updates the running mean and variance online using Welford's logic."""
         self.count += 1
         delta = x - self.mean
         self.mean += delta / self.count
@@ -55,15 +48,14 @@ class SystemStateStore:
         self.lock = threading.Lock()
         self.active_processes = {}  # pid: { metrics }
         self.alerts = []            # list of dicts (logs)
-        
-        # Dynamic baselines scoped by Process Name
-        # process_name: { feature_name: RunningStats }
         self.learned_baselines = {}
+        self.lock_baselines = False  
         
-        # Control Switches
-        self.lock_baselines = False  # If True, stops learning and enforces frozen state
+        # Sliding Window for Process Name Spawning (Fork-Bomb Prevention)
+        self.spawn_history = {}     # name: [timestamp1, timestamp2, ...]
+        self.fork_bomb_blacklist = set() # Set of names identified as active fork-bombs
         
-        # Default Configurations (Adjustable via UI)
+        # Default Configurations
         self.weight_static = 0.3
         self.weight_dynamic = 0.7
         self.alpha = 0.7
@@ -134,7 +126,26 @@ def is_whitelisted(proc: psutil.Process) -> bool:
     return False
 
 # ==========================================
-# 4. MATHEMATICAL ALIGNMENT (Slides 21-24)
+# 4. LIGHTWEIGHT ANCESTRY TRAVERSAL (Cached)
+# ==========================================
+def get_ancestry_chain(proc: psutil.Process) -> str:
+    """Recursively traces parents up to 4 levels. Computed once per process lifecycle."""
+    chain = []
+    curr = proc
+    try:
+        for _ in range(4):
+            chain.append(f"{curr.name()} ({curr.pid})")
+            curr = curr.parent()
+            if not curr or curr.pid <= 1:
+                if curr:
+                    chain.append(f"{curr.name()} ({curr.pid})")
+                break
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    return " ➔ ".join(reversed(chain)) if chain else "Unknown"
+
+# ==========================================
+# 5. MATHEMATICAL ALIGNMENT (Slides 21-24)
 # ==========================================
 class FrameworkEvaluator:
     @staticmethod
@@ -181,7 +192,6 @@ class FrameworkEvaluator:
 
     @staticmethod
     def get_or_create_baselines(proc_name: str, store: SystemStateStore) -> dict:
-        """Retrieves or registers a new process profile, seeded with Slide 23 defaults."""
         with store.lock:
             if proc_name not in store.learned_baselines:
                 store.learned_baselines[proc_name] = {
@@ -189,7 +199,8 @@ class FrameworkEvaluator:
                     "memory_mb":   RunningStats(200.0, 50.0),
                     "threads":     RunningStats(10.0, 3.0),
                     "connections": RunningStats(5.0, 2.0),
-                    "file_ops":    RunningStats(1.0, 1.0)
+                    "file_ops":    RunningStats(1.0, 1.0),
+                    "children_count": RunningStats(0.5, 1.0) 
                 }
             return store.learned_baselines[proc_name]
 
@@ -202,13 +213,14 @@ class FrameworkEvaluator:
             cpu = proc.cpu_percent(interval=None)
             mem_mb = proc.memory_info().rss / (1024 * 1024)
             threads = proc.num_threads()
+            children_count = len(proc.children())
             
-            # Optimized expensive I/O calls
+            # Optimized network & file queries
             connections = 0
             file_ops = 0
-            if cpu > 40.0 or mem_mb > 300.0:
+            if cpu > 40.0 or mem_mb > 300.0 or children_count > 5:
                 try:
-                    connections = len(proc.connections())
+                    connections = len(proc.net_connections())
                     file_ops = len(proc.open_files())
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
                     pass
@@ -220,22 +232,21 @@ class FrameworkEvaluator:
             "memory_mb": mem_mb,
             "threads": threads,
             "connections": connections,
-            "file_ops": file_ops
+            "file_ops": file_ops,
+            "children_count": children_count
         }
 
-        # Dynamically update the learned process profile if baseline is UNLOCKED
+        # Update dynamic baselines if UNLOCKED
         if not store.lock_baselines:
             with store.lock:
                 for feat in telemetry:
                     baselines[feat].update(telemetry[feat])
 
         new_vector = []
-        features = ["cpu_percent", "memory_mb", "threads", "connections", "file_ops"]
+        features = ["cpu_percent", "memory_mb", "threads", "connections", "file_ops", "children_count"]
         
         for idx, feat in enumerate(features):
             val = telemetry[feat]
-            
-            # Retrieve currently learned running mean and standard deviation
             mu = baselines[feat].mean
             sigma = max(baselines[feat].std, 0.001)
             
@@ -246,8 +257,6 @@ class FrameworkEvaluator:
                 A = 0.0
                 
             raw_trust = 1.0 - A
-            
-            # EMA Smoothing (Slide 24)
             prev_t = prev_vector[idx]
             new_t = (store.alpha * prev_t) + ((1.0 - store.alpha) * raw_trust)
             new_vector.append(new_t)
@@ -256,7 +265,7 @@ class FrameworkEvaluator:
         return Td, new_vector
 
 # ==========================================
-# 5. OPTIMIZED DAEMON THREAD
+# 6. PERFORMANCE-TUNED DAEMON THREAD
 # ==========================================
 def run_healing_daemon(store: SystemStateStore):
     process_cache = {}
@@ -264,6 +273,19 @@ def run_healing_daemon(store: SystemStateStore):
     while True:
         current_pids = set()
         active_snapshot = {}
+        now = time.time()
+
+        # Prune old spawn histories outside the process loop to conserve memory
+        with store.lock:
+            for name in list(store.spawn_history.keys()):
+                store.spawn_history[name] = [t for t in store.spawn_history[name] if now - t <= 3.0]
+                # If a name has spawned more than 6 times in 3 seconds, flag it as a Fork-Bomb
+                if len(store.spawn_history[name]) > 6:
+                    if name not in store.fork_bomb_blacklist:
+                        store.fork_bomb_blacklist.add(name)
+                        store.add_alert(0, name, "CRITICAL", 0.0, "Fork-Bomb Pattern Identified (Spawning Storm)")
+                elif name in store.fork_bomb_blacklist and len(store.spawn_history[name]) == 0:
+                    store.fork_bomb_blacklist.discard(name)
 
         for proc_info in psutil.process_iter(['pid', 'name']):
             try:
@@ -271,42 +293,61 @@ def run_healing_daemon(store: SystemStateStore):
                 name = proc_info.info['name']
                 current_pids.add(pid)
 
+                # Initialize cache entry (Ancestry and static features evaluated ONCE)
                 if pid not in process_cache:
                     proc_obj = psutil.Process(pid)
                     if is_whitelisted(proc_obj):
                         continue
+                        
+                    # Track spawn events in the sliding-window
+                    with store.lock:
+                        if name not in store.spawn_history:
+                            store.spawn_history[name] = []
+                        store.spawn_history[name].append(now)
+
                     ts = FrameworkEvaluator.calculate_static_trust(proc_obj)
+                    lineage = get_ancestry_chain(proc_obj) # Cached lineage
                     process_cache[pid] = {
                         "proc_obj": proc_obj,
                         "static_trust": ts,
-                        "prev_vector": [1.0, 1.0, 1.0, 1.0, 1.0]
+                        "lineage": lineage,
+                        "prev_vector": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
                     }
                 else:
                     proc_obj = process_cache[pid]["proc_obj"]
 
                 cache_entry = process_cache[pid]
                 ts = cache_entry["static_trust"]
+                lineage = cache_entry["lineage"]
 
-                # Calculates trust score against currently learned running profile
-                td, new_vector = FrameworkEvaluator.calculate_dynamic_trust(
-                    proc_obj, cache_entry["prev_vector"], store
-                )
-                process_cache[pid]["prev_vector"] = new_vector
+                # Check if this process name has been blacklisted as a Fork-Bomb
+                is_fork_bomb = name in store.fork_bomb_blacklist
 
-                t_final = (store.weight_static * ts) + (store.weight_dynamic * td)
-
-                if t_final <= store.th_suspicious:
+                if is_fork_bomb:
+                    t_final = 0.0
                     status = "CRITICAL"
-                elif store.th_suspicious < t_final <= store.th_normal:
-                    status = "SUSPICIOUS"
                 else:
-                    status = "NORMAL"
+                    # Calculate Dynamic Trust
+                    td, new_vector = FrameworkEvaluator.calculate_dynamic_trust(
+                        proc_obj, cache_entry["prev_vector"], store
+                    )
+                    process_cache[pid]["prev_vector"] = new_vector
+                    t_final = (store.weight_static * ts) + (store.weight_dynamic * td)
+
+                    if t_final <= store.th_suspicious:
+                        status = "CRITICAL"
+                    elif store.th_suspicious < t_final <= store.th_normal:
+                        status = "SUSPICIOUS"
+                    else:
+                        status = "NORMAL"
 
                 action_taken = "Monitoring"
                 if status == "CRITICAL":
                     action_taken = "TERMINATED (Adaptive Healing)"
-                    store.add_alert(pid, name, "CRITICAL", t_final, "Forcefully Terminated (Adaptive Healing)")
+                    details = "Fork-Bomb Mitigation (Recursive)" if is_fork_bomb else f"Anomalous Behavior - {len(proc_obj.children())} Children killed"
+                    store.add_alert(pid, name, "CRITICAL", t_final, details)
                     try:
+                        # Recursively kill all child descendants and parent
                         for child in proc_obj.children(recursive=True):
                             child.kill()
                         proc_obj.kill()
@@ -334,8 +375,9 @@ def run_healing_daemon(store: SystemStateStore):
                 active_snapshot[pid] = {
                     "PID": pid,
                     "Name": name,
+                    "Lineage Chain": lineage,
                     "Static Trust (Ts)": round(ts, 2),
-                    "Dynamic Trust (Td)": round(td, 2),
+                    "Dynamic Trust (Td)": round(td, 2) if not is_fork_bomb else 0.0,
                     "Final Trust T(p,t)": round(t_final, 2),
                     "Status": status,
                     "Action/State": action_taken
@@ -362,10 +404,10 @@ def start_background_thread():
 start_background_thread()
 
 # ==========================================
-# 6. STREAMLIT FRONTEND DASHBOARD
+# 7. STREAMLIT FRONTEND DASHBOARD
 # ==========================================
-st.title("🛡️ Dynamic Self-Healing EDR Dashboard")
-st.markdown("A lightweight autonomous system featuring **Dynamic Baseline Profiling via Welford's Algorithm**.")
+st.title("🛡️ Lineage-Aware Self-Healing EDR Dashboard")
+st.markdown("A performance-optimized autonomous self-healing monitoring engine featuring **Dynamic Baseline Profiling via Welford's Algorithm** and **Sliding-Window Fork-Bomb Prevention**.")
 
 # SIDEBAR: Configuration Panel
 st.sidebar.header("⚙️ Framework Configurations")
@@ -396,18 +438,20 @@ with state_store.lock:
     proc_data = list(state_store.active_processes.values())
     alerts_data = list(state_store.alerts)
     learned_profiles = list(state_store.learned_baselines.keys())
+    active_blacklist = list(state_store.fork_bomb_blacklist)
 
 df_proc = pd.DataFrame(proc_data)
 
 total_monitored = len(df_proc) if not df_proc.empty else 0
 suspicious_count = len(df_proc[df_proc["Status"] == "SUSPICIOUS"]) if not df_proc.empty else 0
 critical_count = sum(1 for a in alerts_data if a["Status"] == "CRITICAL")
+active_fork_bombs = len(active_blacklist)
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total Monitored Processes", total_monitored)
 col2.metric("Suspicious (Throttled)", suspicious_count, delta_color="inverse")
 col3.metric("Critical Terminations", critical_count, delta_color="inverse")
-col4.metric("Known Behavioral Profiles", len(learned_profiles))
+col4.metric("Active Fork Bomb Threats", active_fork_bombs, delta="Blocked" if active_fork_bombs > 0 else "Clear")
 
 # INTERACTIVE VIEW: Inspect Learned Baselines
 st.subheader("🔍 Inspect Learned Behavioral Profiles (Dynamic Baselines)")
@@ -443,7 +487,7 @@ if alerts_data:
         
     st.dataframe(
         df_alerts.style.apply(color_alerts, axis=1),
-        use_container_width=True,
+        width="width", 
         hide_index=True
     )
 else:
@@ -453,6 +497,10 @@ else:
 st.subheader("📊 Active Evaluated Processes")
 
 if not df_proc.empty:
+    # SORT BY FINAL TRUST SCORE (Ascending)
+    # This pushes highly suspicious or critical processes straight to the top of your dashboard.
+    df_sorted = df_proc.sort_values(by="Final Trust T(p,t)", ascending=True)
+
     def color_status(val):
         if val == "SUSPICIOUS":
             return "background-color: #fff2cc; color: black; font-weight: bold;"
@@ -461,10 +509,10 @@ if not df_proc.empty:
         return "color: green;"
 
     st.dataframe(
-        df_proc.style.map(color_status, subset=["Status"]),
-        use_container_width=True,
+        df_sorted.style.map(color_status, subset=["Status"]),
+        width="width", 
         hide_index=True,
-        column_order=["PID", "Name", "Static Trust (Ts)", "Dynamic Trust (Td)", "Final Trust T(p,t)", "Status", "Action/State"]
+        column_order=["PID", "Name", "Lineage Chain", "Static Trust (Ts)", "Dynamic Trust (Td)", "Final Trust T(p,t)", "Status", "Action/State"]
     )
 else:
     st.warning("No user-space processes are currently undergoing active evaluation.")
